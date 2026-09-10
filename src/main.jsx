@@ -106,26 +106,65 @@ function LoginModal({onClose,onDone}){
 }
 
 function AdminPanel({movies,onClose,onChanged}){
-  const [title,setTitle]=useState(''); const [description,setDescription]=useState(''); const [year,setYear]=useState(''); const [genre,setGenre]=useState(''); const [rating,setRating]=useState(''); const [poster,setPoster]=useState(null); const [video,setVideo]=useState(null); const [busy,setBusy]=useState(false); const [message,setMessage]=useState('');
-  async function uploadFile(bucket,file){
-    const safe=file.name.replace(/[^a-zA-Z0-9._-]/g,'-');
-    const path=`${crypto.randomUUID()}-${safe}`;
-    const {error}=await supabase.storage.from(bucket).upload(path,file,{upsert:false});
-    if(error) throw error;
-    return supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
+  const [title,setTitle]=useState(''); const [description,setDescription]=useState(''); const [year,setYear]=useState(''); const [genre,setGenre]=useState(''); const [rating,setRating]=useState(''); const [poster,setPoster]=useState(null); const [video,setVideo]=useState(null); const [busy,setBusy]=useState(false); const [message,setMessage]=useState(''); const [progress,setProgress]=useState(0);
+
+  async function callR2(body){
+    const {data:{session}}=await supabase.auth.getSession();
+    if(!session) throw new Error('Please sign in again.');
+    const res=await fetch('/.netlify/functions/r2-multipart',{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${session.access_token}`},body:JSON.stringify(body)});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok) throw new Error(data.error||'R2 upload service failed.');
+    return data;
   }
+
+  async function uploadVideo(file){
+    const PART_SIZE=50*1024*1024;
+    const totalParts=Math.ceil(file.size/PART_SIZE);
+    setProgress(0);
+    const init=await callR2({action:'init',name:file.name,contentType:file.type||'video/mp4'});
+    const urls=new Map();
+    for(let first=1; first<=totalParts; first+=10){
+      const nums=[]; for(let n=first;n<=Math.min(first+9,totalParts);n++) nums.push(n);
+      const signed=await callR2({action:'sign',key:init.key,uploadId:init.uploadId,partNumbers:nums});
+      signed.urls.forEach(x=>urls.set(x.partNumber,x.url));
+    }
+    const uploaded=[]; let completed=0;
+    const workers=Array.from({length:3},(_,workerIndex)=> (async()=>{
+      for(let part=workerIndex+1; part<=totalParts; part+=3){
+        const start=(part-1)*PART_SIZE; const end=Math.min(start+PART_SIZE,file.size); const blob=file.slice(start,end);
+        const response=await fetch(urls.get(part),{method:'PUT',body:blob});
+        if(!response.ok) throw new Error(`Video upload failed at part ${part} (${response.status}).`);
+        const etag=response.headers.get('ETag'); if(!etag) throw new Error('R2 did not return an ETag. Check the R2 CORS policy.');
+        uploaded.push({PartNumber:part,ETag:etag}); completed++; setProgress(Math.round((completed/totalParts)*100));
+      }
+    })());
+    try { await Promise.all(workers); }
+    catch(err){ try{await callR2({action:'abort',key:init.key,uploadId:init.uploadId});}catch{} throw err; }
+    uploaded.sort((a,b)=>a.PartNumber-b.PartNumber);
+    const done=await callR2({action:'complete',key:init.key,uploadId:init.uploadId,parts:uploaded});
+    setProgress(100); return done.videoUrl;
+  }
+
+  async function uploadPoster(file){
+    const safe=file.name.replace(/[^a-zA-Z0-9._-]/g,'-'); const path=`${crypto.randomUUID()}-${safe}`;
+    const {error}=await supabase.storage.from('posters').upload(path,file,{upsert:false});
+    if(error) throw error; return supabase.storage.from('posters').getPublicUrl(path).data.publicUrl;
+  }
+
   async function publish(e){
-    e.preventDefault(); setBusy(true); setMessage('');
+    e.preventDefault(); setBusy(true); setMessage(''); setProgress(0);
     try{
       if(!video) throw new Error('Please choose a movie video file.');
-      const videoUrl=await uploadFile('movies',video);
-      const posterUrl=poster?await uploadFile('posters',poster):null;
+      setMessage('Uploading video to R2…');
+      const videoUrl=await uploadVideo(video);
+      setMessage('Uploading poster…');
+      const posterUrl=poster?await uploadPoster(poster):null;
       const {error}=await supabase.from('movies').insert({title,description,year:year?Number(year):null,genre,rating:rating?Number(rating):0,poster_url:posterUrl,video_url:videoUrl,published:true});
       if(error) throw error;
-      setTitle('');setDescription('');setYear('');setGenre('');setRating('');setPoster(null);setVideo(null);
+      setTitle('');setDescription('');setYear('');setGenre('');setRating('');setPoster(null);setVideo(null);setProgress(0);
       document.querySelectorAll('input[type=file]').forEach(x=>x.value='');
       setMessage('Published successfully!'); await onChanged();
-    }catch(err){setMessage(err.message||'Upload failed.')}
+    }catch(err){setMessage(err.message||'Upload failed.');}
     setBusy(false);
   }
   async function remove(id){if(!confirm('Delete this movie?'))return; const {error}=await supabase.from('movies').delete().eq('id',id); if(error)alert(error.message); else onChanged();}
@@ -136,7 +175,8 @@ function AdminPanel({movies,onClose,onChanged}){
       <div className="two"><label>Genre<input value={genre} onChange={e=>setGenre(e.target.value)} placeholder="Action, Drama"/></label><label>Rating<input type="number" min="0" max="10" step=".1" value={rating} onChange={e=>setRating(e.target.value)} placeholder="8.5"/></label></div>
       <label>Description<textarea value={description} onChange={e=>setDescription(e.target.value)} placeholder="Short movie description"/></label>
       <label>Poster image<input type="file" accept="image/*" onChange={e=>setPoster(e.target.files?.[0]||null)}/></label>
-      <label>Movie video <span className="hint">(MP4/WebM recommended)</span><input required type="file" accept="video/*" onChange={e=>setVideo(e.target.files?.[0]||null)}/></label>
+      <label>Movie video <span className="hint">(MP4/WebM recommended; MKV may not play in browsers)</span><input required type="file" accept="video/*,.mkv" onChange={e=>setVideo(e.target.files?.[0]||null)}/></label>
+      {busy&&<div className="progressWrap"><div className="progressBar"><span style={{width:`${progress}%`}}/></div><small>{progress}% — keep this page open</small></div>}
       {message&&<div className={message.includes('success')?'success':'error'}>{message}</div>}
       <button className="primary full" disabled={busy}>{busy?'Uploading… please keep this page open':'Upload & Publish'}</button>
     </form>
